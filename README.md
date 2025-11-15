@@ -159,13 +159,26 @@ export MIRROR_LOGGING_LEVEL=info
 ### Blob Requests (`GET /v2/<name>/blobs/<digest>`)
 
 1. Client requests a blob from the mirror registry
-2. Mirror registry first checks if the blob exists in the hot registry
-3. If found in hot registry: Returns HTTP 307 redirect to hot registry
-4. If not found in hot registry: Checks the cold registry
-5. If found in cold registry: Returns HTTP 307 redirect to cold registry
-6. If not found in either: Returns 404
+2. Mirror registry first checks if the blob exists in the hot registry (tries anonymous access first)
+3. If found in hot registry with anonymous access: Returns HTTP 307 redirect to hot registry
+4. If hot registry requires authentication: Checks if blob exists with server credentials, then redirects
+5. If not found in hot registry: Checks the cold registry (same logic)
+6. If found in cold registry: Returns HTTP 307 redirect to cold registry
+7. If not found in either: Returns 404
 
 The client follows the 307 redirect and downloads the blob directly from the appropriate backend, ensuring high performance.
+
+**Important**: If the backend registry requires authentication, you need to login to the backend registry on your Docker client first:
+
+```bash
+# Login to hot registry (if it requires authentication)
+docker login ccr.ccs.tencentyun.com
+
+# Login to cold registry (if it requires authentication)
+docker login registry.liueic.com
+```
+
+When Docker client follows the 307 redirect, it will automatically use the stored credentials for the backend registry domain, allowing seamless authentication.
 
 ## Production Deployment
 

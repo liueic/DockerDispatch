@@ -6,6 +6,7 @@ import (
     "net/http"
     "os"
     "os/signal"
+    "strings"
     "syscall"
     "time"
 
@@ -33,12 +34,32 @@ func main() {
     h := handler.New(cfg, log)
 
     // Register routes
+    // Root path handler
+    router.HandleFunc("/", h.HandleRoot).Methods("GET")
+    
+    // Docker Registry API v2 endpoints
     router.HandleFunc("/v2/", h.HandleV2).Methods("GET")
-    router.HandleFunc("/v2/{name}/manifests/{reference}", h.HandleManifest).Methods("GET")
-    router.HandleFunc("/v2/{name}/blobs/{digest}", h.HandleBlob).Methods("GET")
+    
+    // Manifest and blob endpoints - use PathPrefix to support image names with slashes
+    router.PathPrefix("/v2/").MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) bool {
+        path := r.URL.Path
+        return strings.Contains(path, "/manifests/") || strings.Contains(path, "/blobs/")
+    }).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        path := r.URL.Path
+        if strings.Contains(path, "/manifests/") {
+            h.HandleManifest(w, r)
+        } else if strings.Contains(path, "/blobs/") {
+            h.HandleBlob(w, r)
+        } else {
+            h.HandleNotFound(w, r)
+        }
+    }).Methods("GET")
 
     // Health check endpoint
     router.HandleFunc("/health", h.HandleHealth).Methods("GET")
+    
+    // 404 handler for unmatched routes
+    router.NotFoundHandler = http.HandlerFunc(h.HandleNotFound)
 
     // Create HTTP server
     srv := &http.Server{
