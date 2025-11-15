@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # Self-hosted registry (cold backend)
+  cold-registry:
+    image: registry:2
+    container_name: cold-registry
+    ports:
+      - "5001:5000"
+    volumes:
+      - cold-registry-data:/var/lib/registry
+    environment:
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+    restart: unless-stopped
+
+  # Mirror registry proxy
+  mirror-registry:
+    build: .
+    container_name: mirror-registry
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./config.yaml:/root/config.yaml:ro
+    depends_on:
+      - cold-registry
+    restart: unless-stopped
+    environment:
+      - MIRROR_REGISTRY_HOT_URL=https://registry.cn-hangzhou.aliyuncs.com
+      - MIRROR_REGISTRY_COLD_URL=http://cold-registry:5000
+
+volumes:
+  cold-registry-data:

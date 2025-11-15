@@ -1,0 +1,32 @@
+# Production Configuration Example
+# Copy this file to config.yaml and customize for your environment
+
+server:
+  port: 5000
+
+registry:
+  # Hot registry - typically a cloud registry with better performance
+  hot:
+    url: "https://registry.cn-hangzhou.aliyuncs.com"
+    # Optional: Add authentication if required
+    username: ""
+    password: ""
+    headers:
+      User-Agent: "mirror-registry/1.0"
+      # Add any custom headers required by your registry
+      # X-Custom-Header: "value"
+
+  # Cold registry - typically a self-hosted registry for fallback
+  cold:
+    url: "http://cold-registry:5000"
+    # Optional: Add authentication if required
+    username: ""
+    password: ""
+    headers:
+      User-Agent: "mirror-registry/1.0"
+      # Add any custom headers required by your registry
+      # X-Custom-Header: "value"
+
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json"  # json, console
