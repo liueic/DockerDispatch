@@ -365,7 +365,9 @@ func (h *Handler) HandleManifest(w http.ResponseWriter, r *http.Request) {
 		Msg("Request completed with not found")
 }
 
-// HandleBlob handles blob requests with 307 redirect logic
+// HandleBlob handles blob requests by redirecting to the backend with 307.
+// All blob requests are redirected to the backend (hot or cold), and the Docker client
+// will use its local credentials (from docker login) to authenticate with the backend.
 func (h *Handler) HandleBlob(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	h.logRequestStart(r, "HandleBlob")
@@ -1090,22 +1092,31 @@ func (h *Handler) proxyBlob(w http.ResponseWriter, r *http.Request, backend *con
 }
 
 // redirectBlob redirects blob requests to the backend with 307
-// This function is only called when anonymous access is confirmed to work.
-func (h *Handler) redirectBlob(w http.ResponseWriter, r *http.Request, backend *config.RegistryBackend, name, digest string) bool {
+// The client will use its local credentials (from docker login) to authenticate with the backend.
+// If wwwAuth is provided, it will be included in the response headers to help the client authenticate.
+func (h *Handler) redirectBlob(w http.ResponseWriter, r *http.Request, backend *config.RegistryBackend, name, digest string, wwwAuth string) bool {
 	backendURL := fmt.Sprintf("%s/v2/%s/blobs/%s", strings.TrimSuffix(backend.URL, "/"), name, digest)
 
 	h.logger.Info().
 		Str("backend_url", backendURL).
 		Str("name", name).
 		Str("digest", digest).
-		Msg("Blob found with anonymous access, redirecting client")
+		Str("www_authenticate", wwwAuth).
+		Msg("Blob found, redirecting client to backend (client will handle authentication)")
 
 	w.Header().Set("Location", backendURL)
+	// Include Www-Authenticate header if provided, so Docker client knows how to authenticate
+	if wwwAuth != "" {
+		w.Header().Set("Www-Authenticate", wwwAuth)
+	}
 	w.WriteHeader(http.StatusTemporaryRedirect)
 	return true
 }
 
-// handleBlobRequest handles blob requests by choosing between proxy and redirect based on authentication requirements
+// handleBlobRequest handles blob requests by checking existence with authentication and redirecting with 307.
+// This function uses server-side credentials to authenticate with the backend registry, then extracts the
+// redirect URL (usually a signed storage URL) and returns it to the client via 307 redirect.
+// This approach solves the authentication problem while maintaining the performance benefits of 307 redirects.
 func (h *Handler) handleBlobRequest(w http.ResponseWriter, r *http.Request, backend *config.RegistryBackend, name, digest string) bool {
 	backendStartTime := time.Now()
 	backendURL := fmt.Sprintf("%s/v2/%s/blobs/%s", strings.TrimSuffix(backend.URL, "/"), name, digest)
@@ -1117,232 +1128,335 @@ func (h *Handler) handleBlobRequest(w http.ResponseWriter, r *http.Request, back
 		Int("custom_headers_count", len(backend.Headers)).
 		Str("name", name).
 		Str("digest", digest).
-		Msg("Checking blob existence in backend")
+		Msg("检查后端 blob 是否存在（带认证）")
 
-	// First, try anonymous access to check if backend supports it
+	// Create HEAD request with authentication
 	req, err := http.NewRequestWithContext(r.Context(), "HEAD", backendURL, nil)
 	if err != nil {
 		h.logger.Error().
 			Err(err).
 			Str("backend_url", backendURL).
-			Msg("Failed to create blob HEAD request")
+			Msg("创建 blob HEAD 请求失败")
 		return false
 	}
 
-	// Add custom headers (but not auth yet)
+	// Add Basic Auth if configured
+	if hasAuth {
+		req.SetBasicAuth(backend.Username, backend.Password)
+		h.logger.Debug().
+			Str("backend_url", backendURL).
+			Str("username", backend.Username).
+			Msg("为 HEAD 请求添加 Basic Auth 认证")
+	}
+
+	// Add custom headers
 	for k, v := range backend.Headers {
 		req.Header.Set(k, v)
 	}
 
-	// Try anonymous access first
-	anonResp, err := h.client.Do(req)
-	anonDuration := time.Since(backendStartTime)
+	// Execute HEAD request
+	resp, err := h.client.Do(req)
+	checkDuration := time.Since(backendStartTime)
 	if err != nil {
 		h.logger.Error().
 			Err(err).
 			Str("backend_url", backendURL).
-			Dur("duration_ms", anonDuration).
-			Msg("Failed to check blob existence in backend (anonymous)")
+			Dur("duration_ms", checkDuration).
+			Msg("检查 blob 存在性失败")
 		return false
 	}
-	anonResp.Body.Close()
+	defer resp.Body.Close()
 
 	h.logger.Debug().
 		Str("backend_url", backendURL).
-		Int("status_code", anonResp.StatusCode).
-		Int64("content_length", anonResp.ContentLength).
-		Dur("duration_ms", anonDuration).
-		Msg("Backend anonymous HEAD response received")
+		Int("status_code", resp.StatusCode).
+		Int64("content_length", resp.ContentLength).
+		Dur("duration_ms", checkDuration).
+		Msg("收到后端 HEAD 响应")
 
-	// If anonymous access works, use redirect for better performance
-	if anonResp.StatusCode == http.StatusOK {
-		return h.redirectBlob(w, r, backend, name, digest)
+	// Handle 401 Unauthorized - try Bearer token authentication
+	var bearerToken string
+	if resp.StatusCode == http.StatusUnauthorized && hasAuth {
+		wwwAuth := resp.Header.Get("Www-Authenticate")
+		realm, service, scope := parseWwwAuthenticate(wwwAuth)
+
+		if realm != "" {
+			h.logger.Debug().
+				Str("realm", realm).
+				Str("service", service).
+				Str("scope", scope).
+				Msg("检测到 Bearer 认证要求，尝试获取 token")
+
+			// Get Bearer token
+			token, err := h.getBearerToken(realm, service, scope, backend.Username, backend.Password, backend.Headers)
+			if err != nil {
+				h.logger.Warn().
+					Err(err).
+					Str("backend_url", backendURL).
+					Str("www_authenticate", wwwAuth).
+					Dur("duration_ms", checkDuration).
+					Msg("获取 Bearer token 失败，认证失败")
+				return false
+			}
+
+			bearerToken = token // Save token for later use
+			h.logger.Debug().
+				Str("backend_url", backendURL).
+				Msg("成功获取 Bearer token，使用 token 重试 HEAD 请求")
+
+			// Retry HEAD request with Bearer token
+			retryReq, err := http.NewRequestWithContext(r.Context(), "HEAD", backendURL, nil)
+			if err != nil {
+				h.logger.Error().
+					Err(err).
+					Str("backend_url", backendURL).
+					Msg("创建 Bearer token 重试请求失败")
+				return false
+			}
+
+			// Set Bearer token
+			retryReq.Header.Set("Authorization", "Bearer "+token)
+
+			// Add custom headers
+			for k, v := range backend.Headers {
+				retryReq.Header.Set(k, v)
+			}
+
+			// Execute retry request
+			retryResp, err := h.client.Do(retryReq)
+			retryDuration := time.Since(backendStartTime)
+			if err != nil {
+				h.logger.Error().
+					Err(err).
+					Str("backend_url", backendURL).
+					Dur("duration_ms", retryDuration).
+					Msg("使用 Bearer token 重试 HEAD 请求失败")
+				return false
+			}
+			defer retryResp.Body.Close()
+
+			h.logger.Debug().
+				Str("backend_url", backendURL).
+				Int("status_code", retryResp.StatusCode).
+				Dur("duration_ms", retryDuration).
+				Msg("收到 Bearer token 重试响应")
+
+			// Update resp to retryResp for subsequent processing
+			resp = retryResp
+			checkDuration = retryDuration
+		}
 	}
 
-	// If anonymous access requires auth, use proxy if credentials are configured
-	if anonResp.StatusCode == http.StatusUnauthorized || anonResp.StatusCode == http.StatusForbidden {
-		if !hasAuth {
-			h.logger.Debug().
-				Str("backend_url", backendURL).
-				Str("name", name).
-				Str("digest", digest).
-				Int("status_code", anonResp.StatusCode).
-				Msg("Backend requires authentication but no credentials configured")
-			return false
-		}
-
-		// Verify blob exists with authentication
-		authReq, err := http.NewRequestWithContext(r.Context(), "HEAD", backendURL, nil)
-		if err != nil {
-			h.logger.Error().
-				Err(err).
-				Str("backend_url", backendURL).
-				Msg("Failed to create authenticated blob HEAD request")
-			return false
-		}
-
-		// Add authentication
-		authReq.SetBasicAuth(backend.Username, backend.Password)
+	// Handle 404 Not Found
+	if resp.StatusCode == http.StatusNotFound {
 		h.logger.Debug().
 			Str("backend_url", backendURL).
-			Str("username", backend.Username).
-			Msg("Added basic authentication to backend request")
+			Str("name", name).
+			Str("digest", digest).
+			Dur("duration_ms", checkDuration).
+			Msg("Blob 在后端不存在")
+		return false
+	}
 
-		// Add custom headers
-		for k, v := range backend.Headers {
-			authReq.Header.Set(k, v)
-		}
-
-		authResp, err := h.client.Do(authReq)
-		authDuration := time.Since(backendStartTime)
-		if err != nil {
-			h.logger.Error().
-				Err(err).
+	// Handle redirect responses (307, 302, 301) - backend is redirecting to storage service
+	if resp.StatusCode == http.StatusTemporaryRedirect ||
+		resp.StatusCode == http.StatusFound ||
+		resp.StatusCode == http.StatusMovedPermanently {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			h.logger.Warn().
+				Int("status", resp.StatusCode).
 				Str("backend_url", backendURL).
-				Dur("duration_ms", authDuration).
-				Msg("Failed to check blob existence in backend (authenticated)")
+				Str("name", name).
+				Str("digest", digest).
+				Dur("duration_ms", checkDuration).
+				Msg("后端返回重定向但缺少 Location 头")
 			return false
 		}
-		defer authResp.Body.Close()
 
+		h.logger.Info().
+			Str("backend_url", backendURL).
+			Str("redirect_location", location).
+			Str("name", name).
+			Str("digest", digest).
+			Int("status_code", resp.StatusCode).
+			Dur("duration_ms", checkDuration).
+			Msg("后端返回重定向 URL（通常是签名存储 URL），返回 307 给客户端")
+
+		// Redirect client to the storage service URL
+		w.Header().Set("Location", location)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		return true
+	}
+
+	// Handle 200 OK - blob exists, but we need to check if backend will redirect on GET
+	// Cloud registries (like Tencent CCR) return 200 on HEAD but 307 on GET to storage URL
+	if resp.StatusCode == http.StatusOK {
 		h.logger.Debug().
 			Str("backend_url", backendURL).
-			Int("status_code", authResp.StatusCode).
-			Int64("content_length", authResp.ContentLength).
-			Dur("duration_ms", authDuration).
-			Msg("Backend authenticated HEAD response received")
+			Str("name", name).
+			Str("digest", digest).
+			Dur("duration_ms", checkDuration).
+			Msg("HEAD 请求返回 200，现在发送 GET 请求获取可能的重定向 URL")
 
-		if authResp.StatusCode == http.StatusNotFound {
-			h.logger.Debug().
-				Str("backend_url", backendURL).
-				Str("name", name).
-				Str("digest", digest).
-				Dur("duration_ms", authDuration).
-				Msg("Blob not found in backend")
-			return false
-		}
+		if hasAuth {
+			// We need to make a GET request with the same authentication
+			getReq, err := http.NewRequestWithContext(r.Context(), "GET", backendURL, nil)
+			if err != nil {
+				h.logger.Error().
+					Err(err).
+					Str("backend_url", backendURL).
+					Msg("创建 GET 请求失败")
+				return false
+			}
 
-		if authResp.StatusCode == http.StatusOK {
-			// Blob exists but requires authentication, use proxy
-			h.logger.Info().
-				Str("backend_url", backendURL).
-				Str("name", name).
-				Str("digest", digest).
-				Int("status_code", authResp.StatusCode).
-				Int64("content_length", authResp.ContentLength).
-				Dur("duration_ms", authDuration).
-				Msg("Blob found but requires authentication, proxying request")
-			return h.proxyBlob(w, r, backend, name, digest)
-		}
-
-		// If still 401, check if Bearer token authentication is required
-		if authResp.StatusCode == http.StatusUnauthorized {
-			wwwAuth := authResp.Header.Get("Www-Authenticate")
-			realm, service, scope := parseWwwAuthenticate(wwwAuth)
-
-			if realm != "" {
+			// Use Bearer token if we have one, otherwise use Basic Auth
+			if bearerToken != "" {
+				getReq.Header.Set("Authorization", "Bearer "+bearerToken)
 				h.logger.Debug().
-					Str("realm", realm).
-					Str("service", service).
-					Str("scope", scope).
-					Msg("Attempting to get Bearer token for blob request")
+					Str("backend_url", backendURL).
+					Msg("使用 Bearer Token 发送 GET 请求")
+			} else {
+				getReq.SetBasicAuth(backend.Username, backend.Password)
+				h.logger.Debug().
+					Str("backend_url", backendURL).
+					Msg("使用 Basic Auth 发送 GET 请求")
+			}
 
-				// Get Bearer token
-				token, err := h.getBearerToken(realm, service, scope, backend.Username, backend.Password, backend.Headers)
-				if err != nil {
+			// Add custom headers
+			for k, v := range backend.Headers {
+				getReq.Header.Set(k, v)
+			}
+
+			// Execute GET request
+			getResp, err := h.client.Do(getReq)
+			getDuration := time.Since(backendStartTime)
+			if err != nil {
+				h.logger.Error().
+					Err(err).
+					Str("backend_url", backendURL).
+					Dur("duration_ms", getDuration).
+					Msg("GET 请求失败")
+				return false
+			}
+			defer getResp.Body.Close()
+
+			h.logger.Debug().
+				Str("backend_url", backendURL).
+				Int("status_code", getResp.StatusCode).
+				Dur("duration_ms", getDuration).
+				Msg("收到 GET 响应")
+
+			// Check if GET returns a redirect (this is what we want!)
+			if getResp.StatusCode == http.StatusTemporaryRedirect ||
+				getResp.StatusCode == http.StatusFound ||
+				getResp.StatusCode == http.StatusMovedPermanently {
+				location := getResp.Header.Get("Location")
+				if location == "" {
 					h.logger.Warn().
-						Err(err).
+						Int("status", getResp.StatusCode).
 						Str("backend_url", backendURL).
-						Str("name", name).
-						Str("digest", digest).
-						Str("www_authenticate", wwwAuth).
-						Dur("duration_ms", authDuration).
-						Msg("Failed to get Bearer token for blob, authentication failed")
+						Msg("GET 返回重定向但缺少 Location 头")
 					return false
 				}
 
-				// Retry HEAD request with Bearer token
-				bearerReq, err := http.NewRequestWithContext(r.Context(), "HEAD", backendURL, nil)
-				if err != nil {
-					h.logger.Error().
-						Err(err).
-						Str("backend_url", backendURL).
-						Msg("Failed to create Bearer token blob HEAD request")
-					return false
-				}
+				h.logger.Info().
+					Str("backend_url", backendURL).
+					Str("redirect_location", location).
+					Str("name", name).
+					Str("digest", digest).
+					Int("status_code", getResp.StatusCode).
+					Dur("duration_ms", getDuration).
+					Msg("GET 请求返回重定向 URL（签名存储 URL），返回 307 给客户端")
 
-				// Add custom headers
-				for k, v := range backend.Headers {
-					bearerReq.Header.Set(k, v)
-				}
+				// Redirect client to the storage service URL
+				w.Header().Set("Location", location)
+				w.WriteHeader(http.StatusTemporaryRedirect)
+				return true
+			}
 
-				// Set Bearer token
-				bearerReq.Header.Set("Authorization", "Bearer "+token)
-
-				bearerResp, err := h.client.Do(bearerReq)
-				bearerDuration := time.Since(backendStartTime)
-				if err != nil {
-					h.logger.Error().
-						Err(err).
-						Str("backend_url", backendURL).
-						Dur("duration_ms", bearerDuration).
-						Msg("Failed to check blob existence with Bearer token")
-					return false
-				}
-				defer bearerResp.Body.Close()
-
-				if bearerResp.StatusCode == http.StatusOK {
-					// Blob exists with Bearer token, use proxy
-					h.logger.Info().
-						Str("backend_url", backendURL).
-						Str("name", name).
-						Str("digest", digest).
-						Int("status_code", bearerResp.StatusCode).
-						Int64("content_length", bearerResp.ContentLength).
-						Dur("duration_ms", bearerDuration).
-						Msg("Blob found with Bearer token, proxying request")
-					// Use proxyBlob which will handle Bearer token
-					return h.proxyBlob(w, r, backend, name, digest)
-				}
-
-				h.logger.Warn().
-					Int("status", bearerResp.StatusCode).
+			// If GET returns 200, we need to proxy the actual blob data
+			if getResp.StatusCode == http.StatusOK {
+				h.logger.Info().
 					Str("backend_url", backendURL).
 					Str("name", name).
 					Str("digest", digest).
-					Dur("duration_ms", bearerDuration).
-					Msg("Backend returned non-OK status for blob (with Bearer token)")
-				return false
+					Int64("content_length", getResp.ContentLength).
+					Dur("duration_ms", getDuration).
+					Msg("GET 返回实际 blob 数据，将代理数据流")
+
+				// Copy response headers
+				for k, v := range getResp.Header {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(getResp.StatusCode)
+
+				// Copy response body
+				bodyStartTime := time.Now()
+				bytesCopied, err := io.Copy(w, getResp.Body)
+				bodyDuration := time.Since(bodyStartTime)
+				if err != nil {
+					h.logger.Error().
+						Err(err).
+						Str("backend_url", backendURL).
+						Int64("bytes_copied", bytesCopied).
+						Dur("body_copy_duration_ms", bodyDuration).
+						Msg("代理 blob 数据失败")
+					return false
+				}
+
+				h.logger.Info().
+					Str("backend_url", backendURL).
+					Str("name", name).
+					Str("digest", digest).
+					Int64("bytes_copied", bytesCopied).
+					Dur("total_duration_ms", getDuration).
+					Dur("body_copy_duration_ms", bodyDuration).
+					Msg("成功代理 blob 数据")
+				return true
 			}
+
+			// Other status codes from GET
+			h.logger.Warn().
+				Int("status", getResp.StatusCode).
+				Str("backend_url", backendURL).
+				Str("name", name).
+				Str("digest", digest).
+				Dur("duration_ms", getDuration).
+				Msg("GET 请求返回非预期状态码")
+			return false
 		}
 
+		// Fallback: if no auth, just redirect to backend URL
+		h.logger.Info().
+			Str("backend_url", backendURL).
+			Str("name", name).
+			Str("digest", digest).
+			Dur("duration_ms", checkDuration).
+			Msg("Blob 在后端可访问（无需认证），返回 307 重定向到后端 URL")
+		return h.redirectBlob(w, r, backend, name, digest, "")
+	}
+
+	// Handle other status codes (403, 500, etc.)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		h.logger.Warn().
-			Int("status", authResp.StatusCode).
+			Int("status", resp.StatusCode).
 			Str("backend_url", backendURL).
 			Str("name", name).
 			Str("digest", digest).
-			Dur("duration_ms", authDuration).
-			Msg("Backend returned non-OK status for blob (authenticated)")
+			Str("www_authenticate", resp.Header.Get("Www-Authenticate")).
+			Dur("duration_ms", checkDuration).
+			Msg("认证失败，无法访问后端 blob")
 		return false
 	}
 
-	// Handle other status codes
-	if anonResp.StatusCode == http.StatusNotFound {
-		h.logger.Debug().
-			Str("backend_url", backendURL).
-			Str("name", name).
-			Str("digest", digest).
-			Dur("duration_ms", anonDuration).
-			Msg("Blob not found in backend")
-		return false
-	}
-
+	// Other unexpected status codes
 	h.logger.Warn().
-		Int("status", anonResp.StatusCode).
+		Int("status", resp.StatusCode).
 		Str("backend_url", backendURL).
 		Str("name", name).
 		Str("digest", digest).
-		Dur("duration_ms", anonDuration).
-		Msg("Backend returned non-OK status for blob")
+		Dur("duration_ms", checkDuration).
+		Msg("后端返回非预期状态码")
 	return false
 }
