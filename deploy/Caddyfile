@@ -1,0 +1,60 @@
+# Caddy configuration for Mirror Registry with automatic HTTPS
+# Save this as Caddyfile and run: caddy run
+
+registry.example.com {
+    # Automatic HTTPS with Let's Encrypt
+    tls {
+        # Uncomment to use custom cert/key files
+        # cert /path/to/cert.pem
+        # key /path/to/key.pem
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Frame-Options DENY
+        X-Content-Type-Options nosniff
+        -Server
+    }
+
+    # Client upload size for large images
+    {
+        max_request_body 10G
+    }
+
+    # Proxy to Mirror Registry
+    reverse_proxy 127.0.0.1:5000 {
+        # Preserve host header
+        header_up Host {http.reverse_proxy.upstream.hostport}
+
+        # Forward real client IP
+        header_up X-Real-IP {http.request.remote_host}
+        header_up X-Forwarded-For {http.request.remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Timeouts for large downloads/uploads
+        transport http {
+            dial_timeout 30s
+            read_timeout 300s
+            write_timeout 300s
+        }
+    }
+
+    # Health check endpoint (no logging)
+    handle /health {
+        reverse_proxy 127.0.0.1:5000
+        log {
+            output discard
+        }
+    }
+
+    # Structured logging
+    log {
+        output file /var/log/caddy/registry.log {
+            roll_size 100mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+    }
+}
